@@ -1,0 +1,586 @@
+From f4c5c717e801996d9452fe5788a4ca3476b287bb Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 12 Nov 2026 15:21:50 -0300
+Subject: [PATCH] Integracao com o agente EEG do SENTIR (Meower/BrainFlow)
+
+- lib/eeg_agent_client.dart: cliente WebSocket opcional do agente EEG local
+  (TSYNC com DateTime.now, sessao, fases confirmadas, status/preview)
+- ConfigScreen: campo 'Agente EEG SENTIR' (pref eeg_agent_address)
+- ExperimentScreen: envia sessao/fases ao agente; resumo 'eeg' no status do Central
+- participant_app: marcador de fotodiodo (60x60, branco durante o estimulo)
+- central_dashboard: linha de EEG no cartao; ignora eeg_preview como status
+- station_client: sendEegPreview
+
+Nao compilado (sem Flutter no ambiente de geracao): rodar flutter analyze/test.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HTu6m6nRLQ264LhYi8vc6M
+---
+ CLAUDE.md                  |  26 +++++
+ lib/central_dashboard.dart |  27 +++++
+ lib/eeg_agent_client.dart  | 216 +++++++++++++++++++++++++++++++++++++
+ lib/main.dart              |  66 ++++++++++++
+ lib/participant_app.dart   |  24 ++++-
+ lib/station_client.dart    |   6 ++
+ 6 files changed, 364 insertions(+), 1 deletion(-)
+ create mode 100644 lib/eeg_agent_client.dart
+
+diff --git a/CLAUDE.md b/CLAUDE.md
+index c82b62b..6a7bb17 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -41,6 +41,7 @@ Duas janelas nativas por estação (pacote `desktop_multi_window`):
+ | `lib/station_client.dart` | `StationClient`: cliente WebSocket opcional e **bidirecional** — envia `status`/`telemetry_batch` desta estação ao painel central e recebe `command` de volta (configurar/iniciar/pausar/retomar/parar remotamente), além do round-trip de sincronização de relógio (Elo B, `time_sync_request`/`time_sync_reply`). No-op se não configurado. |
+ | `lib/central_dashboard.dart` | `CentralDashboardScreen`: servidor WebSocket + grid de estações ao vivo (monitor multiparamétrico por cartão) e painel de controle remoto por estação. Nunca escreve no banco — só monitoramento/controle ao vivo. |
+ | `esp32/monitorcardiaco/monitorcardiaco.ino` | Firmware (Arduino framework) do ESP32-C3. Lê MAX30105 (PPG), MLX90614 (temp. periférica), AHT20+BMP280 (ambiente) e envia um JSON por linha via `Serial`. Responde a pings de sincronização de relógio (Elo A, round-trip por software — sem GPS/WiFi) — ver "Sincronização de relógio". |
++| `lib/eeg_agent_client.dart` | Cliente opcional do agente EEG do SENTIR (Meower via BrainFlow) — ver "EEG (SENTIR)". |
+ | `esp32/monitorcardiaco/diagrama.md` | Documento de hardware: diagrama de ligação (Mermaid + tabela de pinagem) e Bill of Materials para montar o ESP32-C3 + AHT20+BMP280 + MAX30102/MAX30105 + MLX90614. |
+ | `assets/data/oasis.csv` | Metadados (valência/arousal) do banco OASIS. |
+ | `assets/images/` | Imagens do banco OASIS (não redistribuir fora do uso previsto pela licença do OASIS — ver `artigo.md`). |
+@@ -543,6 +544,31 @@ revalidada separadamente contra o banco real (fora da UI) e passou. Se esse
+ crash for reproduzido em uso normal (sem automação externa), investigar a
+ interação entre `file_picker` e as janelas gerenciadas por `window_manager`.
+ 
++## EEG (SENTIR) — agente EEG da estação
++
++Integração com o projeto **SENTIR** (placa EEG Meower, ESP32-C3 + ADS1299, via BrainFlow).
++O EEG **não** passa pelo SQLite: um processo Python separado (*agente EEG*, `sentir-agent`)
++roda nesta mesma estação, recebe a Meower por Wi-Fi e grava o EEG localmente em Parquet.
++`lib/eeg_agent_client.dart` liga o app ao agente por WebSocket local (`ws://127.0.0.1:8765/ws/app`):
++
++- **No-op se o endereço estiver vazio** (campo "Agente EEG SENTIR" na `ConfigScreen`,
++  preferência `eeg_agent_address`) — mesmo princípio do `StationClient`.
++- **Relógio**: o agente envia `tsync`; o app responde com `DateTime.now()` (µs) — o MESMO
++  relógio de `exposures.start_timestamp`. O agente converte cada onset para o eixo do EEG.
++- **Sessão/fases**: `startSession` no início do baseline; `phase(...)` logo após cada
++  `startExposure` (mesmo `startTimestamp` confirmado pelo `presentation_ack`); `stopSession`
++  em `_finishExperiment`.
++- **Fotodiodo**: com EEG ativo, `show_image`/`show_fixation` levam `photodiode: true` e a
++  janela do participante desenha um quadrado de 60×60 px no canto inferior esquerdo, branco
++  só durante o estímulo. O fotodiodo da Meower (GPIO1 do ADS1299) mede o onset real na tela —
++  é a resposta de hardware à "Limite honesto de precisão" acima.
++- **Painel Central**: o `status` ganha o campo `eeg` (resumo: canais, bateria, perdas,
++  incerteza de sync, latência de tela, canais saturados) e o cartão mostra uma linha de EEG.
++  `eeg_preview` (traço reduzido) já é repassado; o gráfico no cartão é trabalho futuro.
++
++Protocolo completo e formato dos arquivos: repositório SENTIR, `docs/03-protocolos.md` e
++`docs/04-modelo-de-dados.md`.
++
+ ## O que NÃO foi feito (possíveis próximos passos)
+ 
+ - Calibração real do SpO2 (exigiria hardware de referência e voluntários).
+diff --git a/lib/central_dashboard.dart b/lib/central_dashboard.dart
+index 4fa494d..4eb9745 100644
+--- a/lib/central_dashboard.dart
++++ b/lib/central_dashboard.dart
+@@ -111,6 +111,10 @@ class _CentralDashboardScreenState extends State<CentralDashboardScreen> {
+                   case 'telemetry_batch':
+                     _ingestTelemetry(stationId, map);
+                     break;
++                  case 'eeg_preview':
++                    // SENTIR: traço reduzido do EEG. O gráfico no cartão é a etapa E3
++                    // (SENTIR/docs/etapas/E3-frontend.md); por ora só não confundir com 'status'.
++                    break;
+                   case 'time_sync_request':
+                     // Elo B da sincronização de relógio (ver CLAUDE.md) —
+                     // responde o quanto antes, com T2 (recepção) e T3
+@@ -435,6 +439,7 @@ class _StationCard extends StatelessWidget {
+                 "Sync central: ±${((data['centralSyncErrorUs'] as num) / 1000).toStringAsFixed(2)}ms",
+                 style: const TextStyle(color: Colors.white38, fontSize: 10),
+               ),
++            if (data['eeg'] is Map) _eegLine((data['eeg'] as Map).cast<String, dynamic>()),
+             if (data['sensorConnected'] == false)
+               const Text(
+                 "⚠ sensor desconectado nesta estação",
+@@ -723,3 +728,25 @@ class _StationControlPanelState extends State<_StationControlPanel> {
+     );
+   }
+ }
++
++/// Linha de resumo do EEG (SENTIR) no cartão da estação — ver eeg_agent_client.dart.
++Widget _eegLine(Map<String, dynamic> eeg) {
++  final ok = eeg['error'] == null && eeg['state'] == 'streaming';
++  final sat = (eeg['saturated'] as List?)?.where((e) => e == true).length ?? 0;
++  final parts = <String>[
++    'EEG ${eeg['channels'] ?? '?'}ch',
++    if (eeg['battery_v'] != null) 'bat ${eeg['battery_v']} V',
++    if (eeg['lost'] != null) 'perdas ${eeg['lost']}',
++    if (eeg['sync_ms'] != null) 'sync ±${eeg['sync_ms']} ms',
++    if (eeg['photodiode_latency_ms'] != null) 'tela ${eeg['photodiode_latency_ms']} ms',
++    if (sat > 0) '$sat canal(is) saturado(s)',
++    if (eeg['recording'] == true) 'GRAVANDO',
++    if (eeg['warning'] != null) '${eeg['warning']}',
++    if (eeg['error'] != null) 'erro: ${eeg['error']}',
++  ];
++  return Text(
++    parts.join(' · '),
++    style: TextStyle(color: ok && sat == 0 ? Colors.lightGreenAccent : Colors.orangeAccent, fontSize: 10),
++    overflow: TextOverflow.ellipsis,
++  );
++}
+diff --git a/lib/eeg_agent_client.dart b/lib/eeg_agent_client.dart
+new file mode 100644
+index 0000000..957f84e
+--- /dev/null
++++ b/lib/eeg_agent_client.dart
+@@ -0,0 +1,216 @@
++import 'dart:async';
++import 'dart:convert';
++import 'dart:io';
++
++/// Cliente do **agente EEG do SENTIR** (Python, roda nesta mesma estação e recebe a placa
++/// Meower por Wi-Fi via BrainFlow). Ver SENTIR/docs/03-protocolos.md, seção
++/// "App monitor_oasis <-> agente EEG", e CLAUDE.md, seção "EEG (SENTIR)".
++///
++/// Mesmo princípio do [StationClient]: endereço vazio = no-op completo (a estação continua
++/// funcionando exatamente como antes, sem EEG). O agente grava o EEG localmente, em
++/// Parquet; este cliente só:
++///  - responde às sondas de relógio do agente (`tsync`) com o relógio de parede
++///    (`DateTime.now()`), **o mesmo** usado em `exposures.start_timestamp`. Assim o agente
++///    converte cada onset confirmado para o eixo de tempo do EEG;
++///  - avisa início/fim de sessão e cada fase confirmada pelo `presentation_ack`;
++///  - recebe `eeg_status` (qualidade do sinal, bateria, perdas, sincronização, latência do
++///    fotodiodo) e `eeg_preview` (traço reduzido) para repassar ao Painel Central.
++class EegAgentClient {
++  EegAgentClient({required this.address});
++
++  /// host:porta do agente (normalmente `127.0.0.1:8765`). Vazio = desabilitado.
++  final String address;
++
++  WebSocket? _socket;
++  bool _disposed = false;
++  bool _connecting = false;
++  Timer? _reconnectTimer;
++
++  Map<String, dynamic>? _lastStatus;
++  final _statusController = StreamController<Map<String, dynamic>>.broadcast();
++  final _previewController = StreamController<Map<String, dynamic>>.broadcast();
++  final _repliesController = StreamController<Map<String, dynamic>>.broadcast();
++
++  bool get isEnabled => address.trim().isNotEmpty;
++  bool get isConnected => _socket != null;
++
++  /// Último `eeg_status` recebido (null se desabilitado/desconectado).
++  Map<String, dynamic>? get lastStatus => _lastStatus;
++  Stream<Map<String, dynamic>> get status => _statusController.stream;
++  Stream<Map<String, dynamic>> get preview => _previewController.stream;
++
++  Future<void> start() async {
++    if (!isEnabled || _disposed) return;
++    await _connect();
++  }
++
++  Future<void> _connect() async {
++    if (_disposed || !isEnabled || _connecting || _socket != null) return;
++    _connecting = true;
++    try {
++      final socket = await WebSocket.connect('ws://${address.trim()}/ws/app')
++          .timeout(const Duration(seconds: 3));
++      _socket = socket;
++      socket.listen(
++        _handleIncoming,
++        onDone: _handleDisconnect,
++        onError: (_) => _handleDisconnect(),
++        cancelOnError: true,
++      );
++    } catch (_) {
++      _scheduleReconnect();
++    } finally {
++      _connecting = false;
++    }
++  }
++
++  void _handleIncoming(dynamic message) {
++    // t2 o mais cedo possível: instante de chegada da sonda de relógio.
++    final t2 = DateTime.now().microsecondsSinceEpoch;
++    try {
++      final data = jsonDecode(message as String);
++      if (data is! Map) return;
++      final map = data.cast<String, dynamic>();
++      switch (map['type']) {
++        case 'tsync':
++          _send({
++            'type': 'tsync',
++            'seq': map['seq'],
++            't2': t2,
++            't3': DateTime.now().microsecondsSinceEpoch,
++          });
++          break;
++        case 'eeg_status':
++          _lastStatus = map;
++          _statusController.add(map);
++          break;
++        case 'eeg_preview':
++          _previewController.add(map);
++          break;
++        case 'session_started':
++        case 'session_stopped':
++          _repliesController.add(map);
++          break;
++      }
++    } catch (_) {}
++  }
++
++  void _handleDisconnect() {
++    _socket = null;
++    _lastStatus = null;
++    _scheduleReconnect();
++  }
++
++  void _scheduleReconnect() {
++    if (_disposed || !isEnabled) return;
++    _reconnectTimer?.cancel();
++    _reconnectTimer = Timer(const Duration(seconds: 2), _connect);
++  }
++
++  void _send(Map<String, dynamic> message) {
++    final socket = _socket;
++    if (socket == null) return;
++    try {
++      socket.add(jsonEncode(message));
++    } catch (_) {
++      _handleDisconnect();
++    }
++  }
++
++  /// Abre a gravação do EEG para este participante/sessão (pasta própria no agente).
++  void startSession({
++    required String stationId,
++    required String subjectCode,
++    required int sessionId,
++    Map<String, dynamic> protocol = const {},
++  }) {
++    _send({
++      'type': 'session_start',
++      'station_id': stationId,
++      'subject_code': subjectCode,
++      'session_id': sessionId,
++      'protocol': protocol,
++    });
++  }
++
++  /// Fase confirmada pela janela do participante. [startMs] = o mesmo valor gravado em
++  /// `exposures.start_timestamp` (relógio de parede, ms).
++  void phase({
++    required int? exposureId,
++    required String eventType,
++    required String imageName,
++    required int startMs,
++    required int latencyMs,
++    String category = '',
++    double? valence,
++    double? arousal,
++  }) {
++    _send({
++      'type': 'phase',
++      'exposure_id': exposureId ?? -1,
++      'event_type': eventType,
++      'image_name': imageName,
++      'category': category,
++      'valence': valence,
++      'arousal': arousal,
++      'start_ms': startMs,
++      'latency_ms': latencyMs,
++    });
++  }
++
++  void note(String text) {
++    _send({'type': 'note', 'text': text, 't_ms': DateTime.now().millisecondsSinceEpoch});
++  }
++
++  /// Fecha a gravação. Aguarda (até [timeout]) o resumo do agente: pasta, amostras
++  /// gravadas, reajuste de relógio e latência do fotodiodo.
++  Future<Map<String, dynamic>?> stopSession({
++    Duration timeout = const Duration(seconds: 10),
++  }) async {
++    if (!isConnected) return null;
++    final reply = _repliesController.stream
++        .firstWhere((m) => m['type'] == 'session_stopped')
++        .timeout(timeout);
++    _send({'type': 'session_stop'});
++    try {
++      return await reply;
++    } catch (_) {
++      return null;
++    }
++  }
++
++  /// Resumo compacto para o `status` enviado ao Painel Central.
++  Map<String, dynamic>? summaryForCentral() {
++    final s = _lastStatus;
++    if (s == null) return null;
++    final meower = (s['meower'] as Map?)?.cast<String, dynamic>() ?? const {};
++    final clock = (meower['clock'] as Map?)?.cast<String, dynamic>();
++    final signal = (s['signal'] as Map?)?.cast<String, dynamic>() ?? const {};
++    return {
++      'state': meower['state'],
++      'channels': meower['channels'],
++      'battery_v': meower['battery_v'] ?? signal['battery_v'],
++      'lost': meower['lost'],
++      'sync_ms': clock?['uncertainty_ms'],
++      'app_sync_ms': s['app_sync_ms'],
++      'rms_uv': signal['rms_uv'],
++      'saturated': signal['saturated'],
++      'photodiode_latency_ms': s['photodiode_latency_ms'],
++      'recording': s['recording'],
++      'error': s['error'],
++      'warning': s['warning'],
++    };
++  }
++
++  void dispose() {
++    _disposed = true;
++    _reconnectTimer?.cancel();
++    try {
++      _socket?.close();
++    } catch (_) {}
++    _socket = null;
++    _statusController.close();
++    _previewController.close();
++    _repliesController.close();
++  }
++}
+diff --git a/lib/main.dart b/lib/main.dart
+index 3264225..0894187 100644
+--- a/lib/main.dart
++++ b/lib/main.dart
+@@ -23,6 +23,7 @@ import 'serial_provider.dart';
+ import 'participant_app.dart';
+ import 'hrv_analyzer.dart';
+ import 'station_client.dart';
++import 'eeg_agent_client.dart';
+ import 'central_dashboard.dart';
+ import 'vital_monitor.dart';
+ 
+@@ -339,6 +340,8 @@ class _ConfigScreenState extends State<ConfigScreen> {
+   // sem nenhuma mudança de comportamento em relação ao uso em máquina única.
+   final _stationIdCtrl = TextEditingController(text: "A");
+   final _centralAddressCtrl = TextEditingController();
++  // Agente EEG do SENTIR nesta estação (placa Meower via BrainFlow). Vazio = sem EEG.
++  final _eegAgentCtrl = TextEditingController();
+   bool _simulateEsp32 = false;
+ 
+   // --- Controle remoto pelo Painel Central (ver CLAUDE.md) ---
+@@ -434,6 +437,7 @@ class _ConfigScreenState extends State<ConfigScreen> {
+     final prefs = await SharedPreferences.getInstance();
+     _stationIdCtrl.text = prefs.getString('station_id') ?? "A";
+     _centralAddressCtrl.text = prefs.getString('central_address') ?? "";
++    _eegAgentCtrl.text = prefs.getString('eeg_agent_address') ?? "";
+     String? lastPort = prefs.getString('last_com_port');
+ 
+     // Tenta selecionar automaticamente
+@@ -555,6 +559,7 @@ class _ConfigScreenState extends State<ConfigScreen> {
+         'central_address',
+         _centralAddressCtrl.text.trim(),
+       );
++      await prefs.setString('eeg_agent_address', _eegAgentCtrl.text.trim());
+ 
+       int cycle = int.parse(_imgCtrl.text) + int.parse(_fixCtrl.text);
+       List<OasisImage> playlist = await OasisManager.processCsv(
+@@ -840,6 +845,13 @@ class _ConfigScreenState extends State<ConfigScreen> {
+                         ),
+                       ],
+                     ),
++                    TextFormField(
++                      controller: _eegAgentCtrl,
++                      decoration: const InputDecoration(
++                        labelText: "Agente EEG SENTIR (host:porta) — opcional",
++                        hintText: "ex.: 127.0.0.1:8765 (Meower nesta estação)",
++                      ),
++                    ),
+                   ],
+                 ),
+               ),
+@@ -1268,6 +1280,10 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
+   late DateTime experimentStart;
+   Timer? _uiTimer;
+   late final StationClient _stationClient;
++
++  // --- EEG (SENTIR) — ver eeg_agent_client.dart. No-op se o endereço estiver vazio. ---
++  EegAgentClient? _eeg;
++  StreamSubscription? _eegPreviewSub;
+   int get totalSecondsEstimate =>
+       widget.baselineSec +
+       (widget.playlist.length * (widget.imageSec + widget.fixationSec));
+@@ -1293,6 +1309,14 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
+         errorUs: sample.$3,
+       );
+     });
++    SharedPreferences.getInstance().then((prefs) {
++      final address = prefs.getString('eeg_agent_address') ?? '';
++      if (!mounted || address.trim().isEmpty) return;
++      final eeg = EegAgentClient(address: address)..start();
++      _eeg = eeg;
++      // Traço reduzido do EEG -> Painel Central (mesmo canal da telemetria dos vitais).
++      _eegPreviewSub = eeg.preview.listen(_stationClient.sendEegPreview);
++    });
+     _telemetryTimer = Timer.periodic(const Duration(milliseconds: 200), (_) {
+       if (_pendingTelemetry.isEmpty) return;
+       _stationClient.sendTelemetryBatch(List.of(_pendingTelemetry));
+@@ -1357,6 +1381,7 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
+         'presentationLatencyMs': _lastLatencyMs,
+         'paused': _paused,
+         'centralSyncErrorUs': widget.serialProvider.centralSyncErrorUs,
++        'eeg': _eeg?.summaryForCentral(),
+       });
+     });
+   }
+@@ -1450,6 +1475,8 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
+     _telemetryTimer?.cancel();
+     _commandsSub?.cancel();
+     _centralSyncSub?.cancel();
++    _eegPreviewSub?.cancel();
++    _eeg?.dispose();
+     widget.serialProvider.removeListener(_onSerialSample);
+     _monitor.dispose();
+     widget.serialProvider.shutdown();
+@@ -1501,6 +1528,8 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
+     DesktopMultiWindow.invokeMethod(_subWindowId!, method, {
+       ...args,
+       'seq': seq,
++      // SENTIR: quadrado branco no canto durante o estímulo, lido pelo fotodiodo da Meower
++      'photodiode': _eeg != null,
+     });
+     try {
+       final ts = await completer.future.timeout(const Duration(seconds: 2));
+@@ -1552,6 +1581,24 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
+       startTimestamp: onsetTs,
+       presentationLatencyMs: latencyMs,
+     );
++    _eeg?.startSession(
++      stationId: widget.stationId,
++      subjectCode: widget.subjectCode,
++      sessionId: widget.sessionId,
++      protocol: {
++        'baseline_s': widget.baselineSec,
++        'image_s': widget.imageSec,
++        'fixation_s': widget.fixationSec,
++        'stimuli': widget.playlist.length,
++      },
++    );
++    _eeg?.phase(
++      exposureId: currentExposureId,
++      eventType: "BASELINE",
++      imageName: "BASELINE",
++      startMs: onsetTs,
++      latencyMs: latencyMs,
++    );
+     _lastNonStimulusExposureId = currentExposureId;
+     widget.serialProvider.setRecordingData(
+       currentExposureId,
+@@ -1596,6 +1643,16 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
+       startTimestamp: onsetTs,
+       presentationLatencyMs: latencyMs,
+     );
++    _eeg?.phase(
++      exposureId: currentExposureId,
++      eventType: "STIMULUS",
++      imageName: item.name,
++      category: item.category,
++      valence: item.valence,
++      arousal: item.arousal,
++      startMs: onsetTs,
++      latencyMs: latencyMs,
++    );
+     // Note: não atualiza _lastNonStimulusExposureId — mantém a fixação/
+     // baseline anterior como referência de linha de base para a detecção de
+     // reação deste estímulo (ver _computeAndSaveHrvFeatures).
+@@ -1641,6 +1698,13 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
+       startTimestamp: onsetTs,
+       presentationLatencyMs: latencyMs,
+     );
++    _eeg?.phase(
++      exposureId: currentExposureId,
++      eventType: "FIXATION",
++      imageName: "FIXATION",
++      startMs: onsetTs,
++      latencyMs: latencyMs,
++    );
+     _lastNonStimulusExposureId = currentExposureId;
+     widget.serialProvider.setRecordingData(
+       currentExposureId,
+@@ -1774,6 +1838,8 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
+     _timer?.cancel();
+     _uiTimer?.cancel(); // Cancel UI timer too
+     widget.serialProvider.setRecordingData(null, null);
++    // SENTIR: fecha a gravação do EEG (o agente grava o resumo em session.json)
++    unawaited(_eeg?.stopSession());
+     // widget.serialProvider.disconnect(); // Keep connected for report? No, disconnect to stop reading.
+ 
+     windowManager.setFullScreen(false);
+diff --git a/lib/participant_app.dart b/lib/participant_app.dart
+index 0a83831..0bb6092 100644
+--- a/lib/participant_app.dart
++++ b/lib/participant_app.dart
+@@ -17,6 +17,10 @@ class _ParticipantAppState extends State<ParticipantApp> {
+   String? _currentImagePath;
+   bool _showFixation = false;
+   bool _blackScreen = true;
++  // SENTIR: marcador do fotodiodo (quadrado no canto inferior esquerdo), pedido pela janela
++  // principal quando há agente EEG. Branco só durante o estímulo; o fotodiodo ligado à Meower
++  // mede o instante REAL em que a imagem apareceu, no mesmo ADC do EEG.
++  bool _photodiodeEnabled = false;
+   String? _statusMessage;
+ 
+   @override
+@@ -30,6 +34,7 @@ class _ParticipantAppState extends State<ParticipantApp> {
+             final args = (call.arguments as Map).cast<String, dynamic>();
+             setState(() {
+               _currentImagePath = args['path'] as String?;
++              _photodiodeEnabled = args['photodiode'] == true;
+               _showFixation = false;
+               _blackScreen = false;
+               _statusMessage = null;
+@@ -42,6 +47,7 @@ class _ParticipantAppState extends State<ParticipantApp> {
+             final args = (call.arguments as Map?)?.cast<String, dynamic>();
+             setState(() {
+               _showFixation = true;
++              _photodiodeEnabled = args?['photodiode'] == true;
+               _blackScreen = false;
+               _currentImagePath = null;
+               _statusMessage = null;
+@@ -136,7 +142,23 @@ class _ParticipantAppState extends State<ParticipantApp> {
+       debugShowCheckedModeBanner: false,
+       home: Scaffold(
+         backgroundColor: Colors.black,
+-        body: Center(child: _buildContent()),
++        body: Stack(
++          children: [
++            Center(child: _buildContent()),
++            if (_photodiodeEnabled)
++              Positioned(
++                left: 0,
++                bottom: 0,
++                width: 60,
++                height: 60,
++                child: ColoredBox(
++                  color: (_currentImagePath != null && _statusMessage == null && !_blackScreen)
++                      ? Colors.white
++                      : Colors.black,
++                ),
++              ),
++          ],
++        ),
+       ),
+     );
+   }
+diff --git a/lib/station_client.dart b/lib/station_client.dart
+index dd57dac..1787d21 100644
+--- a/lib/station_client.dart
++++ b/lib/station_client.dart
+@@ -176,6 +176,12 @@ class StationClient {
+     _send({'type': 'telemetry_batch', 'samples': samples});
+   }
+ 
++  /// Traço reduzido do EEG (SENTIR, vindo do agente EEG desta estação) para o
++  /// Painel Central. Mesma política de `sendTelemetryBatch`: sem fila/retry.
++  void sendEegPreview(Map<String, dynamic> preview) {
++    _send({...preview, 'type': 'eeg_preview'});
++  }
++
+   void _send(Map<String, dynamic> message) {
+     final socket = _socket;
+     if (socket == null) return;
+-- 
+2.43.0
+

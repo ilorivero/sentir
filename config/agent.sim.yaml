@@ -1,0 +1,5 @@
+# Desenvolvimento sem hardware:  python tools/meower_sim.py --ads 1 --photodiode-period-s 2
+station_id: A
+data_dir: dados_eeg_sim
+port: 8765
+meower: {driver: udp, ip: 127.0.0.1, ctrl_port: 5000, data_port: 5001, board_ctrl_port: 5100, fs: 1000, pga_gain: 1, init_commands: []}

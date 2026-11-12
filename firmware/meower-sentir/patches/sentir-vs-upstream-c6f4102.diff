@@ -1,0 +1,484 @@
+diff -ruN a/Meower_SENTIR.ino b/Meower_SENTIR.ino
+--- a/Meower_SENTIR.ino	1969-12-31 21:00:00.000000000 -0300
++++ b/Meower_SENTIR.ino	2026-11-12 15:22:28.973417360 -0300
+@@ -0,0 +1,7 @@
++// SENTIR - firmware Meower (ESP32-C3 + ADS1299), derivado de github.com/nikki-uwu/Meower (c6f4102).
++// setup() e loop() estao em main.cpp. Opcoes de compilacao em sentir_config.h.
++//
++// Arduino IDE (core "esp32" da Espressif 3.x):
++//   Placa: "ESP32C3 Dev Module"   USB CDC On Boot: "Enabled"   CPU Frequency: "160MHz"
++//   Flash Mode: "DIO"   Partition Scheme: "Default 4MB with spiffs"
++//   Para testar SEM a placa (ESP32-C3 qualquer): SENTIR_FAKE_ADC 1 em sentir_config.h.
+diff -ruN a/helpers.cpp b/helpers.cpp
+--- a/helpers.cpp	2026-11-12 15:22:28.965525298 -0300
++++ b/helpers.cpp	2026-11-12 15:22:28.972620795 -0300
+@@ -2,6 +2,7 @@
+ // Copyright (c) 2025 Gleb Manokhin (nikki)
+ // Project: Meower
+ 
++#include "sentir_config.h"   // SENTIR
+ #include "helpers.h"
+ 
+ extern Debugger Debug;
+@@ -177,6 +178,7 @@
+ // - Now slave should be fully on and we can configure internal reference Config_3 t0 0xE0 for both master and slave AGAIN and slave will behave as master
+ // - Setup testing signals to be generated internaly, to have 3.75 mV amplitude and period of 1 second
+ // - Setup all channels to be shorted to testing signal, with 0 gain, no SRB for any of them
++void sentir_detect_ads_count(); // SENTIR
+ void ads1299_full_reset()
+ {
+     // We will use digitalWrite instead of WRITE_PERI_REG here since timings are not important.
+@@ -303,8 +305,26 @@
+         // wait for 1 ms
+         delay(1);
+     }
++
++    // SENTIR: 8 ou 16 canais?
++    sentir_detect_ads_count();
++}
++// SENTIR: quantos ADS1299 estao montados. O escravo responde ID 0x3E na leitura em cadeia;
++// sem o chip, DAISY_IN do mestre (com pull-down) devolve 0x00. SENTIR_ADS_COUNT forca o valor.
++volatile uint8_t g_adsCount = 2;
++void sentir_detect_ads_count()
++{
++#if SENTIR_ADS_COUNT == 1 || SENTIR_ADS_COUNT == 2
++    g_adsCount = SENTIR_ADS_COUNT;
++#else
++    RegValues id = read_Register_Daisy(0x00);
++    g_adsCount = ((id.slave_reg_byte & 0x1F) == 0x1E) ? 2 : 1;   // 0x3E: bits[4:0] = 0b11110
++    Debug.log("[ADS1299] ID mestre=0x%02X escravo=0x%02X -> %u chip(s)",
++              id.master_reg_byte, id.slave_reg_byte, (unsigned)g_adsCount);
++#endif
+ }
+ 
++
+ void BCI_preset()
+ {
+     // Make sure continuous Mode is OFF, because we are doing BCI preset
+diff -ruN a/main.cpp b/main.cpp
+--- a/main.cpp	2026-11-12 15:22:28.965795831 -0300
++++ b/main.cpp	2026-11-12 15:22:28.972688997 -0300
+@@ -2,6 +2,8 @@
+ // Copyright (c) 2025 Gleb Manokhin (nikki)
+ // Project: Meower
+ 
++#include "sentir_config.h"   // SENTIR
++#include "sentir_fake_adc.h" // SENTIR
+ #include <Arduino.h>
+ #include <WiFi.h>
+ #include <WiFiUdp.h>
+@@ -260,6 +262,16 @@
+             // Shift by 8 was added to signal to occupy full dynamic range of int32 during unpacking
+             pack_32to24(dspBuffer, parsedADCdata);
+ 
++            // SENTIR: placa de 8 canais (so o mestre). Os slots dos canais 9-15 sao zerados e o
++            // slot do canal 16 leva a palavra de STATUS do mestre (24 bits, sem filtro):
++            //   [23:20]=1100  [19:12]=LOFF_STATP  [11:4]=LOFF_STATN  [3:0]=GPIO4..GPIO1
++            // -> lead-off (contato dos eletrodos) e o fotodiodo no GPIO1, sem gastar canal de EEG.
++            if (g_adsCount < 2)
++            {
++                memset(&parsedADCdata[24], 0, 21);
++                memcpy(&parsedADCdata[45], rawADCdata, 3);
++            }
++
+             // Copy one processed (or raw, if filters are off) ADC frame (16 channels × 24 bits = 48 bytes),
+             // where the timestamp (4 bytes) has already been appended at the end in dataBuffer.
+             // Each frame totals 52 bytes in the packet; memcpy writes only the 48 bytes of channel data here.
+@@ -523,11 +535,18 @@
+ 
+     // DRDY line goes HIGH -> LOW at the end of every ADC conversion.
+     // The ISR merely notifies the ADC task; all heavy SPI I/O happens in task context.
++#if !SENTIR_FAKE_ADC  // SENTIR: no modo emulado o pino DRDY fica solto -> sem interrupcao
+     attachInterrupt(PIN_DRDY,  // GPIO number
+                     drdy_isr,  // ISR function (in IRAM)
+-                    FALLING ); // trigger on falling edge
++                    FALLING );
++#endif
+ 
+     // Right at the end we have to reset ADC so it's at default state.
++#if SENTIR_FAKE_ADC
++    // SENTIR: sem ADS1299 fisico o DRDY vem de um timer na taxa de CONFIG1
++    sentir_fake_begin(adcTaskHandle);
++    Debug.print("[SENTIR] *** MODO ADC EMULADO - nao usar com participantes ***");
++#endif
+     ads1299_full_reset(); // Signal will be square wave with 1s period
+ 
+     // IF we use it for BCI - do preset
+@@ -569,6 +588,9 @@
+ 
+     // Always check for inbound control commands
+     parse_and_execute_command();
++#if SENTIR_FAKE_ADC
++    sentir_fake_update();        // SENTIR: segue mudancas de taxa de amostragem
++#endif
+ 
+     // boot - if 3 seconds passed remove reset flags
+     bootCheck.update();
+diff -ruN a/messages_lib.cpp b/messages_lib.cpp
+--- a/messages_lib.cpp	2026-11-12 15:22:28.965973641 -0300
++++ b/messages_lib.cpp	2026-11-12 15:22:28.972763574 -0300
+@@ -3,6 +3,7 @@
+ // Project: Meower
+ 
+ #include <messages_lib.h>
++#include "sentir_config.h"   // SENTIR
+ #include <string.h>
+ #include <stdlib.h>
+ #include <stdio.h>
+@@ -66,6 +67,7 @@
+ static bool update_channel_register(int channel, uint8_t mask, uint8_t new_bits)
+ {
+     if (channel < 0 || channel > 15) return false;
++    if (channel >= 8 && g_adsCount < 2) return false; // SENTIR: canal 9-16 sem o 2o ADS1299
+     
+     // Determine target ADC and register
+     char target = (channel < 8) ? 'M' : 'S';
+@@ -113,8 +115,9 @@
+ 
+     // Verify
+     RegValues verify = read_Register_Daisy(reg_addr);
+-    bool success = (verify.master_reg_byte == new_master) && 
+-                   (verify.slave_reg_byte == new_slave);
++    // SENTIR: com um so ADS1299 (placa de 8 canais) o escravo nao existe; verificar so o mestre
++    bool success = (verify.master_reg_byte == new_master) &&
++                   ((g_adsCount < 2) || (verify.slave_reg_byte == new_slave));
+ 
+     return success;
+ }
+diff -ruN a/net_manager.cpp b/net_manager.cpp
+--- a/net_manager.cpp	2026-11-12 15:22:28.966051126 -0300
++++ b/net_manager.cpp	2026-11-12 15:22:28.972825537 -0300
+@@ -7,6 +7,8 @@
+ #include <freertos/FreeRTOS.h>
+ #include <freertos/queue.h>
+ #include <esp_err.h>
++#include <esp_timer.h>
++#include "sentir_config.h"   // SENTIR
+ #include <net_manager.h>
+ 
+ 
+@@ -306,6 +308,42 @@
+         return;
+     }
+ 
++    // 0b. SENTIR: sonda de sincronizacao de relogio, respondida AQUI (callback AsyncUDP), fora da
++    //     fila de comandos (que tem ~50 ms de latencia variavel).
++    //     PC -> "TSYNC <seq>"   placa -> "TSYNC <seq> <t2> <t3>"  (ticks de 8 us, 64 bits)
++    //     PC -> "ID?"           placa -> "ID <mac> SENTIR-TSYNC/1 ads=<1|2> fake=<0|1> fw=<versao>"
++    if ((packet.length() >= 6) && (memcmp(packet.data(), "TSYNC ", 6) == 0))
++    {
++        const uint64_t t2 = static_cast<uint64_t>(esp_timer_get_time()) >> 3U;
++        char seq[24] = {0};
++        size_t sl = packet.length() - 6;
++        if (sl > sizeof(seq) - 1) sl = sizeof(seq) - 1;
++        memcpy(seq, packet.data() + 6, sl);
++        for (size_t i = 0; i < sl; ++i) { if (seq[i] == '\r' || seq[i] == '\n' || seq[i] == ' ') { seq[i] = '\0'; break; } }
++        // newlib-nano nao formata 64 bits (%llu): conversao manual
++        auto u64s = [](uint64_t v, char* out) {
++            char tmp[21]; int i = 0;
++            do { tmp[i++] = char('0' + (v % 10U)); v /= 10U; } while (v && i < 20);
++            int j = 0; while (i) out[j++] = tmp[--i]; out[j] = '\0';
++        };
++        char s2[21], s3[21], reply[80];
++        u64s(t2, s2);
++        const uint64_t t3 = static_cast<uint64_t>(esp_timer_get_time()) >> 3U;
++        u64s(t3, s3);
++        int n = snprintf(reply, sizeof(reply), "TSYNC %s %s %s", seq, s2, s3);
++        if (n > 0) packet.write(reinterpret_cast<const uint8_t*>(reply), (size_t)n);
++        return;
++    }
++    if ((packet.length() >= 3) && (memcmp(packet.data(), "ID?", 3) == 0))
++    {
++        char reply[112];
++        int n = snprintf(reply, sizeof(reply), "ID %s SENTIR-TSYNC/1 ads=%u fake=%d fw=%s",
++                         WiFi.macAddress().c_str(), (unsigned)g_adsCount, (int)SENTIR_FAKE_ADC,
++                         SENTIR_FW_VERSION);
++        if (n > 0) packet.write(reinterpret_cast<const uint8_t*>(reply), (size_t)n);
++        return;
++    }
++
+     // 1. PC discovery/keepalive beacon "WOOF_WOOF"
+     if ((packet.length() == WIFI_KEEPALIVE_WORD_LEN) &&
+         (memcmp(packet.data(), WIFI_KEEPALIVE_WORD, WIFI_KEEPALIVE_WORD_LEN) == 0))
+diff -ruN a/sentir_config.h b/sentir_config.h
+--- a/sentir_config.h	1969-12-31 21:00:00.000000000 -0300
++++ b/sentir_config.h	2026-11-12 15:22:28.973250614 -0300
+@@ -0,0 +1,62 @@
++// SPDX-License-Identifier: MIT OR Apache-2.0
++// SENTIR - opcoes de compilacao do firmware Meower (Arduino IDE e ESP-IDF).
++//
++// Arduino IDE: edite os valores abaixo.
++// ESP-IDF:     use `idf.py menuconfig` -> "SENTIR Meower" (o Kconfig define CONFIG_SENTIR_*),
++//              ou edite aqui; o CMake do projeto IDF repassa CONFIG_* para estes nomes.
++#pragma once
++#if defined(__has_include)
++  #if __has_include("sdkconfig.h")
++    #include "sdkconfig.h"   // ESP-IDF: opcoes CONFIG_SENTIR_* do menuconfig
++  #endif
++#endif
++
++#define SENTIR_FW_VERSION "sentir-meower-0.2"
++
++// Numero de ADS1299 montados: 0 = detecta no boot (le o ID do escravo na cadeia),
++// 1 = forca 8 canais (so o mestre), 2 = forca 16 canais.
++#ifndef SENTIR_ADS_COUNT
++  #if defined(CONFIG_SENTIR_ADS_COUNT)
++    #define SENTIR_ADS_COUNT CONFIG_SENTIR_ADS_COUNT
++  #else
++    #define SENTIR_ADS_COUNT 0
++  #endif
++#endif
++
++// 1 = ADS1299 emulado em software (teste num ESP32-C3 qualquer, SEM a placa):
++//     registradores emulados, DRDY gerado por timer na taxa configurada, sinais sinteticos
++//     (alfa 10 Hz, rede 60 Hz, ruido) e bit de "fotodiodo" no GPIO1 do status.
++// NUNCA usar para coletar dados de participantes.
++#ifndef SENTIR_FAKE_ADC
++  #if defined(CONFIG_SENTIR_FAKE_ADC)
++    #define SENTIR_FAKE_ADC 1
++  #else
++    #define SENTIR_FAKE_ADC 0
++  #endif
++#endif
++
++// Com SENTIR_FAKE_ADC: quantos ADS1299 emular (1 = placa de 8 canais da v1).
++#ifndef SENTIR_FAKE_ADS_COUNT
++  #if defined(CONFIG_SENTIR_FAKE_ADS_COUNT)
++    #define SENTIR_FAKE_ADS_COUNT CONFIG_SENTIR_FAKE_ADS_COUNT
++  #else
++    #define SENTIR_FAKE_ADS_COUNT 1
++  #endif
++#endif
++
++// Com SENTIR_FAKE_ADC: GPIO do ESP32 lido como "fotodiodo" (nivel ALTO = luz).
++// -1 = onda quadrada interna de 1 Hz (para testes automaticos).
++// Ex.: 9 = botao BOOT da maioria dos devkits (ativo em BAIXO -> invertido no codigo).
++#ifndef SENTIR_FAKE_PD_PIN
++  #if defined(CONFIG_SENTIR_FAKE_PD_PIN)
++    #define SENTIR_FAKE_PD_PIN CONFIG_SENTIR_FAKE_PD_PIN
++  #else
++    #define SENTIR_FAKE_PD_PIN -1
++  #endif
++#endif
++
++#ifdef __cplusplus
++#include <stdint.h>
++// Numero de ADS1299 efetivamente em uso (definido no boot por sentir_detect_ads_count()).
++extern volatile uint8_t g_adsCount;
++#endif
+diff -ruN a/sentir_fake_adc.cpp b/sentir_fake_adc.cpp
+--- a/sentir_fake_adc.cpp	1969-12-31 21:00:00.000000000 -0300
++++ b/sentir_fake_adc.cpp	2026-11-12 15:22:28.972846664 -0300
+@@ -0,0 +1,172 @@
++// SPDX-License-Identifier: MIT OR Apache-2.0
++// SENTIR - emulador do ADS1299 (ver sentir_config.h, SENTIR_FAKE_ADC).
++//
++// Emula o suficiente do ADS1299 para o firmware Meower rodar sem modificacoes no resto:
++//  - comandos SPI SDATAC/RDATAC/START/STOP/RESET (ignorados ou resetam registradores);
++//  - RREG/WREG nos alvos 'M', 'S' e 'B' (leitura em cadeia de 30 bytes: mestre em rx[2],
++//    escravo em rx[29]), com ID 0x3E e valores de reset do datasheet;
++//  - leitura de dados (54 bytes de zeros enviados): 2 x (status de 3 bytes + 8 canais),
++//    com o ganho PGA dos registradores CHnSET aplicado;
++//  - DRDY: esp_timer periodico na taxa de CONFIG1 (250..4000 Hz) acordando a tarefa do ADC.
++#include "sentir_fake_adc.h"
++
++#if SENTIR_FAKE_ADC
++#include <Arduino.h>
++#include <esp_timer.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
++#include <math.h>
++#include <string.h>
++
++namespace {
++constexpr int NREG = 0x18;
++uint8_t regs[2][NREG];               // [0] mestre, [1] escravo
++bool present[2] = {true, SENTIR_FAKE_ADS_COUNT >= 2};
++TaskHandle_t adcTask = nullptr;
++esp_timer_handle_t timer = nullptr;
++uint32_t currentPeriodUs = 0;
++uint32_t sampleIndex = 0;
++uint32_t rng = 0x12345678u;
++constexpr float LSB_UV = 4.5f / 8388608.0f * 1e6f;
++
++void resetRegs(int chip) {
++    memset(regs[chip], 0, NREG);
++    regs[chip][0x00] = 0x3E;            // ID ADS1299
++    regs[chip][0x01] = 0x96;            // CONFIG1: 250 SPS
++    regs[chip][0x02] = 0xC0;
++    regs[chip][0x03] = 0x60;
++    for (int r = 0x05; r <= 0x0C; r++) regs[chip][r] = 0x61;  // CHnSET: PGA 24, entrada em curto
++    regs[chip][0x14] = 0x0F;            // GPIO: todos entradas
++}
++
++inline uint32_t xorshift() { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; }
++inline float gaussish() {               // soma de 4 uniformes ~ gaussiana (barato)
++    float s = 0; for (int i = 0; i < 4; i++) s += (xorshift() & 0xFFFF) / 65535.0f;
++    return (s - 2.0f) * 1.7f;
++}
++
++int pgaFromReg(uint8_t chset) {
++    static const int lut[8] = {1, 2, 4, 6, 8, 12, 24, 24};
++    return lut[(chset >> 4) & 0x07];
++}
++
++uint32_t periodFromConfig1() {
++    static const uint32_t hz[8] = {16000, 8000, 4000, 2000, 1000, 500, 250, 250};
++    return 1000000u / hz[regs[0][0x01] & 0x07];
++}
++
++bool photodiodeLevel() {
++#if SENTIR_FAKE_PD_PIN >= 0
++    // BOOT (GPIO9) e ativo em baixo; um fototransistor com resistor de pull-down e ativo em alto.
++    int v = digitalRead(SENTIR_FAKE_PD_PIN);
++    return SENTIR_FAKE_PD_PIN == 9 ? (v == LOW) : (v == HIGH);
++#else
++    return (esp_timer_get_time() % 1000000) < 500000;  // 1 Hz, 50 %
++#endif
++}
++
++void put24(uint8_t* p, int32_t v) {
++    if (v > 8388607) v = 8388607;
++    if (v < -8388608) v = -8388608;
++    p[0] = (uint8_t)((v >> 16) & 0xFF);
++    p[1] = (uint8_t)((v >> 8) & 0xFF);
++    p[2] = (uint8_t)(v & 0xFF);
++}
++
++void fillSample(uint8_t* rx, uint8_t length) {
++    memset(rx, 0, length);
++    const float t = sampleIndex * (periodFromConfig1() * 1e-6f);
++    sampleIndex++;
++    const uint8_t gpioIn = photodiodeLevel() ? 0x1 : 0x0;   // GPIO1 = fotodiodo
++    for (int chip = 0; chip < 2; chip++) {
++        uint8_t* blk = rx + chip * 27;
++        if (chip * 27 + 27 > length) break;
++        if (!present[chip]) continue;          // sem chip: DAISY_IN com pull-down -> zeros
++        // status: 1100 + LOFF_STATP(8) + LOFF_STATN(8) + GPIO[4:1]
++        uint32_t status = 0xC00000u | (chip == 0 ? gpioIn : 0);
++        blk[0] = (status >> 16) & 0xFF; blk[1] = (status >> 8) & 0xFF; blk[2] = status & 0xFF;
++        for (int ch = 0; ch < 8; ch++) {
++            const int g = pgaFromReg(regs[chip][0x05 + ch]);
++            const uint8_t mux = regs[chip][0x05 + ch] & 0x07;
++            float uv;
++            if (mux == 0x01) {                  // SHORTED: so ruido do amplificador
++                uv = 0.3f * gaussish();
++            } else if (mux == 0x05) {           // TEST: quadrada interna ~3,75 mV, 1 Hz
++                uv = (fmodf(t, 1.0f) < 0.5f) ? 1875.0f : -1875.0f;
++            } else {
++                const int idx = chip * 8 + ch;
++                uv = 20.0f * sinf(2.0f * (float)M_PI * 10.0f * t + idx)     // alfa
++                   + 5.0f * sinf(2.0f * (float)M_PI * 60.0f * t)           // rede eletrica
++                   + 3.0f * gaussish();
++            }
++            put24(blk + 3 + ch * 3, (int32_t)lroundf(uv * g / LSB_UV));
++        }
++    }
++}
++
++void IRAM_ATTR onTimer(void*) {
++    if (adcTask) xTaskNotifyGive(adcTask);
++}
++}  // namespace
++
++bool sentir_fake_xfer(char target, uint8_t length, const uint8_t* tx, uint8_t* rx) {
++    static bool init = false;
++    if (!init) { resetRegs(0); resetRegs(1); init = true; }
++    const uint8_t op = tx[0];
++    int chips[2]; int n = 0;
++    if (target == 'M' || target == 'B') chips[n++] = 0;
++    if (target == 'S' || target == 'B') chips[n++] = 1;
++
++    if (op == 0x00 && length >= 27) {           // leitura de amostra (RDATAC: zeros no MOSI)
++        fillSample(rx, length);
++        return true;
++    }
++    memset(rx, 0, length);
++    if (op == 0x06) { resetRegs(0); resetRegs(1); return true; }   // RESET
++    if ((op & 0xE0) == 0x20 && length >= 3) {   // RREG
++        const uint8_t addr = op & 0x1F, cnt = tx[1] + 1;
++        for (int k = 0; k < n; k++) {
++            const int chip = chips[k];
++            if (!present[chip]) continue;
++            const int base = (target == 'B') ? chip * 27 : 0;
++            for (int i = 0; i < cnt && base + 2 + i < length && addr + i < NREG; i++)
++                rx[base + 2 + i] = regs[chip][addr + i];
++        }
++        return true;
++    }
++    if ((op & 0xE0) == 0x40 && length >= 3) {   // WREG
++        const uint8_t addr = op & 0x1F, cnt = tx[1] + 1;
++        for (int k = 0; k < n; k++) {
++            const int chip = chips[k];
++            if (!present[chip]) continue;
++            for (int i = 0; i < cnt && 2 + i < length && addr + i < NREG; i++)
++                if (addr + i != 0x00) regs[chip][addr + i] = tx[2 + i];
++        }
++        return true;
++    }
++    return true;  // SDATAC/RDATAC/START/STOP/WAKEUP/STANDBY: nada a fazer
++}
++
++void sentir_fake_begin(void* handle) {
++    adcTask = (TaskHandle_t)handle;
++#if SENTIR_FAKE_PD_PIN >= 0
++    pinMode(SENTIR_FAKE_PD_PIN, SENTIR_FAKE_PD_PIN == 9 ? INPUT_PULLUP : INPUT_PULLDOWN);
++#endif
++    esp_timer_create_args_t args = {};
++    args.callback = &onTimer;
++    args.name = "fake_drdy";
++    esp_timer_create(&args, &timer);
++    currentPeriodUs = periodFromConfig1();
++    esp_timer_start_periodic(timer, currentPeriodUs);
++}
++
++void sentir_fake_update() {
++    if (!timer) return;
++    const uint32_t p = periodFromConfig1();
++    if (p != currentPeriodUs) {
++        esp_timer_stop(timer);
++        currentPeriodUs = p;
++        esp_timer_start_periodic(timer, p);
++    }
++}
++#endif  // SENTIR_FAKE_ADC
+diff -ruN a/sentir_fake_adc.h b/sentir_fake_adc.h
+--- a/sentir_fake_adc.h	1969-12-31 21:00:00.000000000 -0300
++++ b/sentir_fake_adc.h	2026-11-12 15:22:28.973262916 -0300
+@@ -0,0 +1,14 @@
++// SPDX-License-Identifier: MIT OR Apache-2.0
++// SENTIR - emulador do ADS1299 para testar o firmware Meower num ESP32-C3 sem a placa.
++#pragma once
++#include <stdint.h>
++#include "sentir_config.h"
++
++#if SENTIR_FAKE_ADC
++// Substitui a transferencia SPI (chamado no inicio de xfer()). Retorna true se tratou.
++bool sentir_fake_xfer(char target, uint8_t length, const uint8_t* tx, uint8_t* rx);
++// Inicia o timer que imita o DRDY (chamar no fim do setup()).
++void sentir_fake_begin(void* adcTaskHandle);
++// Ajusta o periodo do timer quando a taxa muda (chamar no loop()).
++void sentir_fake_update();
++#endif
+diff -ruN a/spi_lib.cpp b/spi_lib.cpp
+--- a/spi_lib.cpp	2026-11-12 15:22:28.966278359 -0300
++++ b/spi_lib.cpp	2026-11-12 15:22:28.972935832 -0300
+@@ -3,6 +3,7 @@
+ // Project: Meower
+ 
+ #include "spi_lib.h"
++#include "sentir_fake_adc.h"   // SENTIR
+ #include <Arduino.h>
+ #include <driver/gpio.h>
+ #include <freertos/FreeRTOS.h>
+@@ -114,6 +115,10 @@
+                     const uint8_t * txData,
+                     uint8_t       * rxData)
+ {
++#if SENTIR_FAKE_ADC
++    // SENTIR: sem ADS1299 fisico, o emulador responde no lugar do barramento SPI
++    if (sentir_fake_xfer(target, length, txData, rxData)) return;
++#endif
+     // Block every interrupt + scheduler
+     portENTER_CRITICAL(&spiMux);
+ 

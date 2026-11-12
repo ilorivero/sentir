@@ -1,0 +1,18 @@
+# SENTIR - agente EEG da estacao (copie para config/agent.yaml e ajuste)
+station_id: A                 # o MESMO "ID Estacao" configurado no monitor_oasis
+data_dir: C:/SENTIR/dados_eeg # grava aqui: <estacao>/<codigo_participante>/<data-hora>/
+host: 127.0.0.1               # so o app desta estacao conversa com o agente
+port: 8765
+preview_hz: 50                # traco de EEG para o Painel Central (0 = desliga)
+meower:
+  driver: brainflow           # brainflow (producao) | udp (Python puro, sem BrainFlow)
+  ip: 192.168.50.11           # IP fixo da Meower desta estacao (reserva no roteador)
+  ctrl_port: 5000
+  data_port: 5001
+  fs: 1000                    # 250|500|1000|2000|4000 Hz
+  pga_gain: 24
+  channels: auto              # auto: a placa informa 8 (1 ADS1299) ou 16 (2 ADS1299)
+  channel_names: [Fp1, Fp2, F3, F4, C3, C4, O1, O2]
+  init_commands:
+    - sys networkfreq 60      # Brasil
+    - sys filters_off         # grava bruto

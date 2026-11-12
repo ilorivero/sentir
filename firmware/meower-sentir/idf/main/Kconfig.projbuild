@@ -1,0 +1,18 @@
+menu "SENTIR Meower"
+    config SENTIR_ADS_COUNT
+        int "Numero de ADS1299 (0 = detectar no boot)"
+        range 0 2
+        default 0
+    config SENTIR_FAKE_ADC
+        bool "ADS1299 emulado (testar sem a placa; NUNCA com participantes)"
+        default n
+    config SENTIR_FAKE_ADS_COUNT
+        int "ADS1299 emulados"
+        depends on SENTIR_FAKE_ADC
+        range 1 2
+        default 1
+    config SENTIR_FAKE_PD_PIN
+        int "GPIO lido como fotodiodo no modo emulado (-1 = onda de 1 Hz)"
+        depends on SENTIR_FAKE_ADC
+        default -1
+endmenu

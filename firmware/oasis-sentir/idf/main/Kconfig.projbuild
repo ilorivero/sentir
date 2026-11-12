@@ -1,0 +1,5 @@
+menu "SENTIR Oasis"
+    config SENTIR_FAKE_SENSORS
+        bool "Sensores simulados (testar sem MAX30102/MLX90614/AHT20/BMP280; NUNCA em coleta)"
+        default n
+endmenu

@@ -1,0 +1,445 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2025 Gleb Manokhin (nikki)
+// Project: Meower
+
+#include <Arduino.h>
+#include <cstring>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <esp_err.h>
+#include <esp_timer.h>
+#include "sentir_config.h"   // SENTIR
+#include <net_manager.h>
+
+
+//  cmdQue is defined in main.cpp.  Bring it into this compilation unit so
+//  handleRxPacket() can push inbound datagrams without a linker error.
+extern QueueHandle_t cmdQue;
+extern Debugger      Debug; 
+
+
+// Wi-Fi event handler - plain C function pointer (no captures)
+// ---------------------------------------------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------------------------------
+static NetManager* s_netMgr = nullptr;   // set once in NetManager::begin()
+
+// The compiler creates: ['M','E','O','W','_','M','E','O','W','\0']
+// That's 10 bytes total (including null terminator)
+// sizeof(boardDiscoveryBeacon) = 10
+// But you only want to send 9 characters, not the '\0'
+// So: sizeof(boardDiscoveryBeacon) - 1 = 9
+constexpr char boardDiscoveryBeacon[] = "MEOW_MEOW";
+
+
+
+
+// wifiEventCb() - global Wi-Fi event hook
+//
+// - Must be a plain C function (no captures) because WiFi.onEvent() on
+//   the ESP32 Arduino core expects a raw pointer, not std::function.
+// - The Wi-Fi driver task can emit events very early in boot, before
+//   NetManager::begin() runs.  In that window the global instance
+//   pointer (s_netMgr) is still nullptr, so we guard against it.
+// - After NetManager::begin() executes, s_netMgr is set and every
+//   subsequent event is forwarded to NetManager::onWifiEvent().
+// ---------------------------------------------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------------------------------
+static void wifiEventCb(WiFiEvent_t event, WiFiEventInfo_t /*info*/)
+{
+    // The Wi-Fi driver task can emit events very early in boot, before
+    // NetManager::begin() runs.  In that window the global instance
+    Debug.log("wifiEventCb() id=%d", static_cast<int>(event)); 
+    if (s_netMgr)
+    {
+        Debug.print("wifiEventCb: forward to NetManager"); 
+        s_netMgr->onWifiEvent(event);   // forward to class instance
+    }
+}
+
+
+
+
+// NetManager::onWifiEvent() - runs in Wi-Fi driver task, adjusts reconnect flags
+// ---------------------------------------------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------------------------------
+void NetManager::onWifiEvent(WiFiEvent_t event)
+{
+    Debug.log("onWifiEvent() id=%d  state=%u", static_cast<int>(event),
+                                        static_cast<uint8_t>(_state)); 
+
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED)
+    {
+        // We have to use safe time delta
+        uint32_t now       = millis();
+        uint32_t timeDelta = safeTimeDelta(now, _lastRxMs);
+
+        Debug.log("EVENT DISCONNECTED  rxΔ=%lu", timeDelta);
+        _state      = LinkState::DISCONNECTED; // stop sending right now
+        _peerFound  = false;                   // force beacon handshake
+        _lastFailMs = now;
+        _reconnPend = true;
+        _giveUp     = false;
+
+        esp_err_t rc = esp_wifi_connect();      // async, non-blocking
+        if (rc == ESP_ERR_WIFI_STATE)
+        {
+            // Already reconnecting - leave _reconnPend true
+            // and keep the 1-minute wall timer running.
+        }
+    }
+    else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP)
+    {
+        Debug.print("EVENT GOT_IP  reconnect OK");
+        _localIP    = WiFi.localIP();
+        _reconnPend = false;
+        _giveUp     = false;
+        _lastFailMs = 0;
+
+        Debug.log("[CONNECT EVENT] localIP      : %s",  _localIP.toString().c_str());
+        Debug.log("[CONNECT EVENT] state        : %u" , static_cast<uint8_t>(_state));
+        Debug.log("[CONNECT EVENT] peerFound    : %d" , _peerFound);
+        Debug.log("[CONNECT EVENT] reconnPend   : %d" , _reconnPend);
+        Debug.log("[CONNECT EVENT] giveUp       : %d" , _giveUp);
+    }
+}
+
+
+
+
+// Begin
+// ---------------------------------------------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------------------------------
+// 1. Link callback on wifi events
+// 2. Initialize WiFi at minimum TX power to prevent over-saturation
+// 3. Start connection and increase to operational TX power
+// 4. Remember ports & peer IP
+// 5. Open the existing WiFiUDP socket for TX
+// 6. Start an AsyncUDP listener for RX. This is event-driven, so the CPU
+//    sleeps until a packet arrives - there is no polling overhead.
+void NetManager::begin(const char* ssid,
+                       const char* pass,
+                       uint16_t    localPortCtrl,
+                       uint16_t    remotePortData)
+{
+    // 1. Link-state callback - event-driven watchdog
+    // Save "this" in a global hook so the plain-C Wi-Fi callback
+    // knows which NetManager object to talk to.
+    s_netMgr = this;           // expose this instance
+    WiFi.onEvent(wifiEventCb); // register static handler
+
+    // 2. Initialize WiFi at minimum TX power to prevent over-saturation
+    WiFi.mode(WIFI_MODE_STA); // station-only; turns off the soft-AP
+    WiFi.setTxPower(WIFI_POWER_2dBm);  // Start at absolute minimum
+    Debug.log("[WIFI] Initialized at 2 dBm TX power to prevent over-saturation");
+    
+    // 3. Start connection and increase to operational TX power
+    WiFi.begin(ssid, pass);
+    
+    // Immediately increase power for actual communication
+    // WiFi hardware is now initialized safely, increase power for connection
+    WiFi.setTxPower(NORMAL_MODE_TX_POWER);  // Operational power for communication
+    Debug.log("[WIFI] TX power increased to 11 dBm for connection");
+
+    // 4. Remember ports & peer IP
+    _localPortCtrl  = localPortCtrl;
+    _remotePortData = remotePortData;
+
+    // 5. Outbound socket
+    _udp.begin(0);
+
+    // 6. Inbound socket - zero-poll AsyncUDP
+    _asyncRx.listen(localPortCtrl);
+    _asyncRx.onPacket([this](AsyncUDPPacket& pkt) { handleRxPacket(pkt); });
+
+    _state    = LinkState::IDLE;
+    _lastRxMs = millis();
+}
+
+
+
+
+// Send
+// ---------------------------------------------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------------------------------
+void NetManager::sendCtrl(const void* data, size_t len)
+{
+    // Tiny guard - avoid building an empty UDP packet.
+    if (len == 0) return;
+    _udp.beginPacket(_remoteIP, _localPortCtrl); // use control port
+    _udp.write(static_cast<const uint8_t*>(data), len);
+    _udp.endPacket();
+}
+void NetManager::sendData(const void* data, size_t len)
+{
+    // Tiny guard - avoid building an empty UDP packet.
+    if (_state != LinkState::STREAMING || len == 0) return;
+    _udp.beginPacket(_remoteIP, _remotePortData); // use data port
+    _udp.write(static_cast<const uint8_t*>(data), len);
+    _udp.endPacket();
+    Debug.log("sendData: %u B", (unsigned)len);   
+
+    if (_udp.getWriteError())
+    {
+        Debug.print("sendData: UDP WRITE-ERR");
+
+        // Clear UDP write-error flag after logging, or the next call will always
+        // return the same error until a successful packet:
+        _udp.clearWriteError();
+    }
+}
+
+
+
+
+// NetManager::update()
+// - Runs once per loop() iteration.
+// - Handles link-watchdog timeout and 1 s discovery beacons while idle.
+// ---------------------------------------------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------------------------------
+void NetManager::update(void)
+{
+    const uint32_t   now = millis();
+    static LinkState prevState = _state;  
+
+    // 1. STREAMING watchdog - drop to IDLE if we have not heard from the PC
+    // for more than _timeoutMs (10 000 ms by default).
+    //
+    // The TCP/IP task updates _lastRxMs when a packet arrives. If that write/interrupt
+    // lands BETWEEN our read of millis() and our later read of _lastRxMs,
+    // the subtraction under-flows and produces 0xFFFFFFFF (-1).  We guard
+    // against that by forcing the delta to 0 whenever the clock went “backward”.
+    {
+        uint32_t rxDelta = safeTimeDelta(now, _lastRxMs); // wrap-safe and race-safe if TCP/IP interrupts and updates _lastRxMs before if condition
+
+        if ((_state == LinkState::STREAMING) && (rxDelta > _timeoutMs))
+        {
+            // send a debug message
+            Debug.log("WATCHDOG: no data %lu ms - drop to IDLE", rxDelta);
+
+            // Switch state to idle
+            _state = LinkState::IDLE;
+
+            
+            _udp.flush();             // abort any half-sent datagram
+            xQueueReset(cmdQue);      // clear pending commands
+            _peerFound    = false;    // force beacon cycle
+            _lastBeaconMs = 0;
+        }
+    }
+
+    // 2. GLOBAL silence guard - covers IDLE as well
+    //    If we have not heard a single byte for _timeoutMs, assume the PC
+    //    is gone and restart discovery beacons even when not streaming.
+    if (_peerFound && (safeTimeDelta(now, _lastRxMs) > _timeoutMs))
+    {
+        Debug.print("SILENCE: peer lost - restart beacon");
+        _peerFound    = false;          // forget the peer
+        _lastBeaconMs = 0;              // beacon immediately
+        xQueueReset(cmdQue);            // clear stale commands
+    }
+
+    // 2.1. Wi-Fi reconnect watchdog - fail-safe if >1 min
+    if (_reconnPend && (safeTimeDelta(now, _lastFailMs) > WIFI_RECONNECT_GIVEUP_MS))
+    {
+        Debug.print("FAILSAFE TIMER: reconnect >1 min");
+        failSafe();
+    }
+
+    // 3. Discovery beacon - 1 s cadence until a packet is heard again
+    if (!_peerFound && (safeTimeDelta(now, _lastBeaconMs) >= WIFI_BEACON_PERIOD))
+    {
+        Debug.print("BEACON TX - MEOW MEOW");
+        _udp.beginPacket(IPAddress(255,255,255,255), _localPortCtrl);
+        _udp.write((const uint8_t*) boardDiscoveryBeacon, sizeof(boardDiscoveryBeacon) - 1);
+        _udp.endPacket();
+        _lastBeaconMs = now;
+    }
+
+    _dbgActive = (_state == LinkState::STREAMING);
+
+    if (prevState != _state)                                   // <<< ADD BLOCK
+    {
+        Debug.log("STATE %u->%u  peer=%d rxΔ=%lu",
+            (unsigned)prevState, (unsigned)_state,
+            (int)_peerFound, safeTimeDelta(now, _lastRxMs));
+        prevState = _state;
+    }
+    debugGate(now);                      // prints only when _dbgActive
+}
+
+// Drive LED - one call per loop()
+void NetManager::driveLed(Blinker &led) noexcept
+{
+    static LedMode last = LedMode::DISC;
+    LedMode now;
+
+    // LOST overrides normal modes
+    now = _giveUp ? LedMode::LOST : ledMode();
+
+    if (now == last) return;          // re-configure only on change
+    last = now;
+
+    switch (now)
+    {
+        case LedMode::DISC: led.burst(3, LED_ON_MS, 5000); break; // 3 × 0.25 s
+        case LedMode::IDLE: led.burst(2, LED_ON_MS, 5000); break; // 2 × 0.25 s
+        case LedMode::STRM: led.burst(1, LED_ON_MS, 5000); break; // 1 × 0.25 s
+        case LedMode::LOST: led.burst(5, LED_ON_MS, 5000); break; // 5 × 0.25 s
+    }
+}
+
+
+
+
+// NetManager::handleRxPacket()
+// Called by AsyncUDP when a datagram arrives. Runs in the TCP/IP task
+// (lower priority than ADC), so it must finish quickly and never block.
+// ---------------------------------------------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------------------------------
+void NetManager::handleRxPacket(AsyncUDPPacket& packet)
+{
+    Debug.log("RX pkt len=%u", (unsigned)packet.length());
+    
+    // 0. Ignore our own discovery beacon ("MEOW_MEOW")
+    if ((packet.length() == 9) && 
+        (memcmp(packet.data(), "MEOW_MEOW", 9) == 0))
+    {
+        Debug.print("RX ignore: MEOW_MEOW echo"); 
+        return;
+    }
+
+    // 0b. SENTIR: sonda de sincronizacao de relogio, respondida AQUI (callback AsyncUDP), fora da
+    //     fila de comandos (que tem ~50 ms de latencia variavel).
+    //     PC -> "TSYNC <seq>"   placa -> "TSYNC <seq> <t2> <t3>"  (ticks de 8 us, 64 bits)
+    //     PC -> "ID?"           placa -> "ID <mac> SENTIR-TSYNC/1 ads=<1|2> fake=<0|1> fw=<versao>"
+    if ((packet.length() >= 6) && (memcmp(packet.data(), "TSYNC ", 6) == 0))
+    {
+        const uint64_t t2 = static_cast<uint64_t>(esp_timer_get_time()) >> 3U;
+        char seq[24] = {0};
+        size_t sl = packet.length() - 6;
+        if (sl > sizeof(seq) - 1) sl = sizeof(seq) - 1;
+        memcpy(seq, packet.data() + 6, sl);
+        for (size_t i = 0; i < sl; ++i) { if (seq[i] == '\r' || seq[i] == '\n' || seq[i] == ' ') { seq[i] = '\0'; break; } }
+        // newlib-nano nao formata 64 bits (%llu): conversao manual
+        auto u64s = [](uint64_t v, char* out) {
+            char tmp[21]; int i = 0;
+            do { tmp[i++] = char('0' + (v % 10U)); v /= 10U; } while (v && i < 20);
+            int j = 0; while (i) out[j++] = tmp[--i]; out[j] = '\0';
+        };
+        char s2[21], s3[21], reply[80];
+        u64s(t2, s2);
+        const uint64_t t3 = static_cast<uint64_t>(esp_timer_get_time()) >> 3U;
+        u64s(t3, s3);
+        int n = snprintf(reply, sizeof(reply), "TSYNC %s %s %s", seq, s2, s3);
+        if (n > 0) packet.write(reinterpret_cast<const uint8_t*>(reply), (size_t)n);
+        return;
+    }
+    if ((packet.length() >= 3) && (memcmp(packet.data(), "ID?", 3) == 0))
+    {
+        char reply[112];
+        int n = snprintf(reply, sizeof(reply), "ID %s SENTIR-TSYNC/1 ads=%u fake=%d fw=%s",
+                         WiFi.macAddress().c_str(), (unsigned)g_adsCount, (int)SENTIR_FAKE_ADC,
+                         SENTIR_FW_VERSION);
+        if (n > 0) packet.write(reinterpret_cast<const uint8_t*>(reply), (size_t)n);
+        return;
+    }
+
+    // 1. PC discovery/keepalive beacon "WOOF_WOOF"
+    if ((packet.length() == WIFI_KEEPALIVE_WORD_LEN) &&
+        (memcmp(packet.data(), WIFI_KEEPALIVE_WORD, WIFI_KEEPALIVE_WORD_LEN) == 0))
+    {
+        if (!_peerFound)
+        {
+            // DISCOVERY: First WOOF_WOOF - capture IP
+            _remoteIP = packet.remoteIP();
+            _peerFound = true;
+            Debug.log("PC discovered at %s", _remoteIP.toString().c_str());
+        }
+        // else: Already discovered - just keepalive, don't touch IP
+        
+        _lastRxMs = millis();
+        
+        if (_state == LinkState::DISCONNECTED)
+            _state = LinkState::IDLE;
+        return;
+    }
+
+    // 2. If peer not found yet, reject everything else
+    if (!_peerFound)
+    {
+        Debug.log("RX dropped - waiting for WOOF_WOOF discovery");
+        return;
+    }
+
+    // 3. Over-sized packet protection
+    if (packet.length() > CMD_BUFFER_SIZE - 1)
+    {
+        Debug.log("RX oversize: %u B dropped", (unsigned)packet.length());
+        return;
+    }
+    
+    // 4. Queue command
+    static char rxBuf[CMD_BUFFER_SIZE];
+    size_t n = packet.length();
+    memcpy(rxBuf, packet.data(), n);
+    rxBuf[n] = '\0';
+
+    // Try to enqueue; if the queue is full we drop this packet.
+    xQueueSend(cmdQue, rxBuf, 0);
+    Debug.print("RX cmd queued");
+
+    // 5. Update watchdog
+    _lastRxMs = millis();
+}
+
+void NetManager::failSafe(void)
+{
+    Debug.print("FAILSAFE: giving up, radio off");
+    stopStream();                        // drop to DISCONNECTED
+    WiFi.disconnect(true, true);         // radio off, erase PMK
+    _udp.flush();
+
+    _giveUp     = true;                  // LED shows LOST state
+    _reconnPend = false;
+    _peerFound  = false;
+    _state      = LinkState::DISCONNECTED;
+    _lastBeaconMs = 0;
+
+    xQueueReset(cmdQue);                 // clear command queue
+}
+
+void NetManager::debugPrint(void)
+{
+#if SERIAL_DEBUG
+    static uint32_t seq = 0;
+
+    Debug.log("=== NetManager === %lu", seq++);
+
+    Debug.log(" localIP      : %s",  _localIP.toString().c_str());
+    Debug.log(" state        : %u" , static_cast<uint8_t>(_state));
+    Debug.log(" peerFound    : %d" , _peerFound);
+    Debug.log(" reconnPend   : %d" , _reconnPend);
+    Debug.log(" giveUp       : %d" , _giveUp);
+    Debug.log(" lastFailMs   : %lu", _lastFailMs);
+    Debug.log(" lastRxMs     : %lu", _lastRxMs);
+    Debug.log(" lastBeaconMs : %lu", _lastBeaconMs);
+    Debug.log(" rxΔ          : %lu", safeTimeDelta(millis(), _lastRxMs));
+
+    Debug.print(" ===");
+#endif
+}
+
+inline void NetManager::debugGate(uint32_t now)
+{
+#if SERIAL_DEBUG
+    if (_dbgActive)
+    {
+        static uint32_t dbgT = 0;
+        if (now - dbgT > 50)            // 20 Hz print cadence
+        {
+            debugPrint();
+            dbgT = now;
+        }
+    }
+#endif
+}

@@ -1,0 +1,15 @@
+_deps/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.pio/
+firmware/*/idf/build*/
+firmware/*/idf/sdkconfig
+firmware/*/idf/sdkconfig.old
+firmware/*/idf/dependencies.lock
+firmware/*/idf/managed_components/
+firmware/*/idf/components/arduino-esp32
+firmware/oasis-sentir/libraries/
+dados_eeg*/
+config/agent.yaml
